@@ -40,7 +40,7 @@ const SIGNALING_SERVER_URL = 'http://localhost:9999';
 const PC_CONFIG = {};
 
 // elements
-let audioElement;
+//let audioElement;
 let connectButton;
 let disconnectButton;
 let username = "unknown";
@@ -57,6 +57,7 @@ class PeerData {
         this.peername = peername;
         this.connection = null;
         this.stream = null;
+        this.audio = new Audio();
     }
 
     createConnection() {
@@ -94,7 +95,12 @@ class PeerData {
                 // event = { receiver, streams, track, transceiver }
                 if (event.track.kind == 'audio') {
                     console.log(`onTrack: id=${id} connecting inbound audio to audioElement`);
-                    audioElement.srcObject = event.streams[0]
+                    // connect stream to player
+                    let peer = peers[id];
+                    if (peer) {
+                        peer.audio.srcObject = event.streams[0];
+                        peer.audio.play();
+                    }
                 }
             }
 
@@ -229,9 +235,13 @@ function updatePeerButtons() {
                     break;
             }
         }
+        // unfortunately the ids handed out by socketio are not necessarily safe for element ids
+        // so we use a "sanitized" id for the peer's corresponding button element
         let sanitized_id = peer.sanitized_id;
-        // TODO: figure out if we can put non-sanitized id in onClick argument
-        peer_html += `<li>${peername} <button style="${style};" id="${sanitized_id}" onClick="togglePeerConnection(this.id)">${button_text}</button></li>`;
+        peer_html += '<li>'
+            + peername
+            + ` <button style="${style};" id="${sanitized_id}" onClick="togglePeerConnection(this.id)">${button_text}</button>`
+            + '</li>';
     }
     document.querySelector('#peerList').innerHTML = peer_html;
 }
@@ -367,6 +377,7 @@ function togglePeerConnection(sanitized_id) {
         for (let [key, peer] of Object.entries(peers)) {
             let sanitized_key = peer.sanitized_id;
             if (sanitized_key == sanitized_id) {
+                console.log(`adebug found button ${sanitized_id}`);
                 peer.toggleConnection();
                 found_peer = true;
                 break;
@@ -404,7 +415,7 @@ async function init() {
     } else if (navigator.userAgent.indexOf("Firefox") != -1) {
         username = "Firefox";
     }
-    audioElement = document.querySelector('#audioOutput');
+    //audioElement = document.querySelector('#audioOutput');
     connectButton = document.querySelector('#connectButton');
     connectButton.onclick = connect;
     connectButton.disabled = false;
