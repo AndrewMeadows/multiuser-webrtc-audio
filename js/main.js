@@ -90,11 +90,13 @@ class PeerData {
                 }
             };
 
-            pc.onaddstream = (event) => {
-                // TODO: this callback is deprecated, use ontrack instead
-                console.log(`onAddStream: id=${id}`);
-                audioElement.srcObject = event.stream;
-            };
+            pc.ontrack = (event) => {
+                // event = { receiver, streams, track, transceiver }
+                if (event.track.kind == 'audio') {
+                    console.log(`onTrack: id=${id} connecting inbound audio to audioElement`);
+                    audioElement.srcObject = event.streams[0]
+                }
+            }
 
             pc.addStream(outbound_audio_stream);
         } catch (error) {
