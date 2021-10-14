@@ -1,21 +1,21 @@
 'use strict';
 
-//// check for support of insertable streams
-//if (typeof MediaStreamTrackProcessor === 'undefined' ||
-//    typeof MediaStreamTrackGenerator === 'undefined') {
-//    alert("insertable streams non supported");
-//}
-//
-//try {
-//    new MediaStreamTrackGenerator('audio');
-//    console.log("Audio insertable streams supported");
-//} catch (e) {
-//    alert("Your browser does not support insertable audio streams");
-//}
-//
-//if (typeof AudioData === 'undefined') {
-//    alert("Your browser does not support WebCodecs.");
-//}
+// check for support of insertable streams
+if (typeof MediaStreamTrackProcessor === 'undefined' ||
+    typeof MediaStreamTrackGenerator === 'undefined') {
+    alert("insertable streams non supported");
+}
+
+try {
+    new MediaStreamTrackGenerator('audio');
+    console.log("Audio insertable streams supported");
+} catch (e) {
+    alert("Your browser does not support insertable audio streams");
+}
+
+if (typeof AudioData === 'undefined') {
+    alert("Your browser does not support WebCodecs.");
+}
 
 const SIGNALING_SERVER_URL = 'http://localhost:9999';
 
@@ -165,6 +165,34 @@ class PeerData {
 // peers is a map from id to peername: { "id" : "peername", ... }
 let peers = {};
 
+/**  @returns The "best" audio constraints supported by the client. In this
+ * case, "best" is defined as "the constraints that will produce the
+ * highest-quality audio." That means disabling Echo Cancellation, disabling
+ * Noise Suppression, and disabling Automatic Gain Control.
+ */
+function getBestAudioConstraints() {
+    let audioConstraints = {};
+
+    if (typeof (navigator) !== "undefined"
+        && typeof (navigator.mediaDevices) !== "undefined"
+        && typeof (navigator.mediaDevices.getSupportedConstraints) !== "undefined")
+    {
+        if (navigator.mediaDevices.getSupportedConstraints().echoCancellation) {
+            audioConstraints.echoCancellation = false;
+        }
+
+        if (navigator.mediaDevices.getSupportedConstraints().noiseSuppression) {
+            audioConstraints.noiseSuppression = false;
+        }
+
+        if (navigator.mediaDevices.getSupportedConstraints().autoGainControl) {
+            audioConstraints.autoGainControl = false;
+        }
+    }
+    return audioConstraints;
+}
+
+
 function sendSignal(id, signal) {
     if (socket) {
         //console.log(`SEND id=${id} signal=${signal}`);
@@ -219,7 +247,8 @@ async function closeAllPeerConnections() {
 
 async function connect() {
     if (outbound_audio_stream == null) {
-        navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        let constraints = getBestAudioConstraints();
+        navigator.mediaDevices.getUserMedia({ audio: constraints, video: false })
             .then((stream) => {
                 outbound_audio_stream = stream;
             });
