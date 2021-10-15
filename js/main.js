@@ -1,5 +1,7 @@
 'use strict';
 
+let wasm_addPulseTone = Module.cwrap( "addPulseTone", null, ["number", "number", "number"]);
+
 // check for support of insertable streams
 if (typeof MediaStreamTrackProcessor === 'undefined' ||
     typeof MediaStreamTrackGenerator === 'undefined') {
@@ -40,13 +42,121 @@ const SIGNALING_SERVER_URL = 'http://localhost:9999';
 const PC_CONFIG = {};
 
 // elements
-//let audioElement;
 let connectButton;
 let disconnectButton;
 let username = "unknown";
 
 let socket;
 let outbound_audio_stream;
+
+const BYTES_PER_FLOAT = 4;
+
+class Oscillator {
+    // Oscillator is a struct for storing two floats in WASM memory
+    // [ omega, phase ]
+    constructor(frequency) {
+        let num_bytes = 2 * BYTES_PER_FLOAT;
+        let ptr = Module._malloc(num_bytes);
+        this.memory = ptr;
+
+        const TWO_PI = 2.0 * Math.PI;
+        let omega = frequency * TWO_PI;
+        let phase = 0.0;
+        Module.setValue(ptr, omega, "float");
+        Module.setValue(ptr + BYTES_PER_FLOAT, phase, "float");
+    }
+
+    destroy() {
+        Module._free(this.memory);
+        this.memory = -1;
+    }
+}
+
+class AudioBlock {
+    // AudioBlock is a struct for storing related floats in WASM memory
+    // with some intelligence for moving audio data to/from WASM memory
+    // [ num_channels, num_frames, sample_rate, data... ]
+    constructor() {
+        // Note: we expect stereo frames of 1024 samples
+        // but we allocate twice that memory for safety
+        const BLOCK_SIZE = 2 * 2048;
+
+        let num_block_bytes = BLOCK_SIZE * BYTES_PER_FLOAT;
+        let num_bytes = 3 * BYTES_PER_FLOAT + num_block_bytes;
+        let ptr = Module._malloc(num_bytes);
+        this.memory = ptr;
+
+        let byte_offset = ptr + 3 * BYTES_PER_FLOAT;
+        this.dataF32 = new Float32Array(Module.HEAP32.buffer, byte_offset, BLOCK_SIZE);
+    }
+
+    copyFrom(data) {
+        // [ num_channels, num_frames, sample_rate, data... ]
+        Module.setValue(this.memory, data.numberOfChannels, "float");
+        Module.setValue(this.memory + BYTES_PER_FLOAT, data.numberOfFrames, "float");
+        Module.setValue(this.memory + 2 * BYTES_PER_FLOAT, data.sampleRate, "float");
+
+        const format = 'f32-planar';
+        for (let i = 0; i < data.numberOfChannels; i++) {
+            const offset = data.numberOfFrames * i;
+            const samples = this.dataF32.subarray(offset, offset + data.numberOfFrames);
+            data.copyTo(samples, {planeIndex: i, format});
+        }
+    }
+
+    getData() {
+        let num_channels = Module.getValue(this.memory, "float");
+        let num_samples = Module.getValue(this.memory + BYTES_PER_FLOAT, "float");
+        return this.dataF32.subarray(0, num_channels * num_samples);
+    }
+
+    destroy() {
+        Module._free(this.memory);
+        this.memory = -1;
+    }
+}
+
+class PulseToneAdder {
+    // PulseToneAdder is a class that tracks its own WASM memory
+    // and supplies a "transform function" for a TransformStream
+    constructor() {
+        this.pulse = new Oscillator(0.75); // three pulses every four seconds
+        this.tone = new Oscillator(120.0); // 120Hz tone
+        this.block = new AudioBlock(); // block of audio data
+    }
+
+    destroy() {
+        this.pulse.destroy();
+        this.tone.destroy();
+        this.block.destroy();
+    }
+
+    // returns a transform function for use with TransformStream.
+    getTransform() {
+        let pulse = this.pulse;
+        let tone = this.tone;
+        let block = this.block;
+        const format = 'f32-planar';
+        return (data, controller) => {
+            console.log("DEBUG PulseToneAdder.getTransform() callback");
+            // copy data into WASM memory
+            block.copyFrom(data);
+
+            // this is where all the compute happens... in embedded WASM code
+            wasm_addPulseTone(pulse.memory, tone.memory, block.memory);
+
+            // pass the processed data to the controller
+            controller.enqueue(new AudioData({
+                format,
+                sampleRate: data.sampleRate,
+                numberOfFrames: data.numberOfFrames,
+                numberOfChannels: data.numberOfChannels,
+                timestamp: data.timestamp,
+                data: block.getData()
+            }));
+        };
+    }
+};
 
 // PeerData is a struct for tracking PeerConnection to known peer
 // with intelligence about how to create/signal/destroy the connection
@@ -58,6 +168,17 @@ class PeerData {
         this.connection = null;
         this.stream = null;
         this.audio = new Audio();
+        this.pulseToneAdder = null;
+
+        // DEBUG: these callbacks for making sure audio events are happening
+        this.audio.onabort = (event) => { console.log("DEBUG audio.onabort"); };
+        this.audio.onended = (event) => { console.log("DEBUG audio.onended"); };
+        this.audio.onpause = (event) => { console.log("DEBUG audio.onpause"); };
+        this.audio.onplay = (event) => { console.log("DEBUG audio.onplay"); };
+        this.audio.onplaying = (event) => { console.log("DEBUG audio.onplaying"); };
+        this.audio.onstalled = (event) => { console.log("DEBUG audio.onstalled"); };
+        this.audio.onsuspend = (event) => { console.log("DEBUG audio.onsuspend"); };
+        this.audio.onwaiting = (event) => { console.log("DEBUG audio.onwaiting"); };
     }
 
     createConnection() {
@@ -92,14 +213,64 @@ class PeerData {
             };
 
             pc.ontrack = (event) => {
+                console.log(`onTrack id=${id}`);
                 // event = { receiver, streams, track, transceiver }
                 if (event.track.kind == 'audio') {
-                    console.log(`onTrack: id=${id} connecting inbound audio to audioElement`);
                     // connect stream to player
                     let peer = peers[id];
+                    /* this simple path works: stream straight to audio device
                     if (peer) {
+                        console.log(`onTrack: id=${id} connecting inbound stream to audio element`);
                         peer.audio.srcObject = event.streams[0];
                         peer.audio.play();
+                    }
+                    */
+                    
+                    // This is what I'm trying to do: stream through processor before going
+                    // to audio device, but it doesn't work: no sound out the speakers.
+                    // In fact, the wasm_addPulseTone() method is never called. 
+                    // What am I doing wrong?
+                    if (peer) {
+                        console.log(`onTrack: id=${id} passing inbound stream through processor`);
+                        if (peer.pulseToneAdder) {
+                            // we don't expect to fall in here but just in case...
+                            // call stopAudio() which will clear the pulseToneAdder
+                            // and release its WASM memory
+                            peer.stopAudio();
+                        }
+                        peer.pulseToneAdder = new PulseToneAdder();
+
+                        // this is the insertable-streams magic: we create the cogs and pipes
+                        let processor = new MediaStreamTrackProcessor({ track: event.track });
+                        let generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+                        const source = processor.readable;
+                        const sink = generator.writable;
+                        let transformer = new TransformStream({transform: peer.pulseToneAdder.getTransform()});
+
+                        // connect our contraption's output to the audio element
+                        let processedStream = new MediaStream();
+                        processedStream.addTrack(generator);
+                        peer.audio.srcObject = processedStream;
+                        peer.audio.play();
+
+                        // the abortController is for cleanup in case soemthing goes wrong
+                        // during the async pipeThrough operation
+                        let abortController = new AbortController();
+                        const signal = abortController.signal;
+
+                        // connect the rest of the pipes asynchronously
+                        // Note: promise.then() is never called until the contraption is dismantled
+                        const promise = source.pipeThrough(transformer, {signal}).pipeTo(sink);
+                        promise.catch((e) => {
+                            if (signal.aborted) {
+                                console.log(`Shutting down stream ${id} after abort`);
+                            } else {
+                                console.error(`Error from stream transform: id=${id} err='${e.message}'`);
+                            }
+                            source.cancel(e);
+                            sink.abort(e);
+                            peer.stopAudio();
+                        });
                     }
                 }
             }
@@ -167,6 +338,26 @@ class PeerData {
         } catch (e) {
             console.log(`PeerData.handleSignal: failed id=${id} err=${e.message}`);
         }
+    }
+
+    stopAudio() {
+        console.log("DEBUG stopAudio()");
+        if (this.audio) {
+            this.audio.pause();
+            this.audio.srcObject = null;
+        }
+        if (this.pulseToneAdder) {
+            this.pulseToneAdder.destroy();
+            this.pulseToneAdder = null;
+        }
+    }
+
+    destroy() {
+        if (this.connection) {
+            this.connection.close();
+            this.connection = null;
+        }
+        this.stopAudio();
     }
 };
 
@@ -248,10 +439,7 @@ function updatePeerButtons() {
 
 async function closeAllPeerConnections() {
     for (let [key, peer] of Object.entries(peers)) {
-        if (peer.connection) {
-            peer.connection.close();
-            peer.connection = null;
-        }
+        peer.destroy();
     }
     peers = {}
     updatePeerButtons();
@@ -338,6 +526,7 @@ function handlePeerData(data) {
         for (var i =0; i < peer_list.length; i++) {
             let id = peer_list[i];
             if (id in peers) {
+                peers[id].destroy();
                 delete peers[id];
                 something_changed = true;
             }
@@ -377,14 +566,13 @@ function togglePeerConnection(sanitized_id) {
         for (let [key, peer] of Object.entries(peers)) {
             let sanitized_key = peer.sanitized_id;
             if (sanitized_key == sanitized_id) {
-                console.log(`adebug found button ${sanitized_id}`);
                 peer.toggleConnection();
                 found_peer = true;
                 break;
             }
         }
         if (!found_peer) {
-            console.log(`togglePeerConnection did not find peer with sanitized_id=${sanitized_id}`);
+            console.log(`DEBUG togglePeerConnection did not find peer with sanitized_id=${sanitized_id}`);
         }
     }
 }
@@ -415,7 +603,11 @@ async function init() {
     } else if (navigator.userAgent.indexOf("Firefox") != -1) {
         username = "Firefox";
     }
-    //audioElement = document.querySelector('#audioOutput');
+
+    Module.onRuntimeInitialized = () => {
+        console.log("WASM Module initialized");
+    };
+
     connectButton = document.querySelector('#connectButton');
     connectButton.onclick = connect;
     connectButton.disabled = false;
