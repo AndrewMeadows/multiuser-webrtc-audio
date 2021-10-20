@@ -90,13 +90,12 @@ class AudioBlock {
         this.dataF32 = new Float32Array(Module.HEAP32.buffer, byte_offset, BLOCK_SIZE);
     }
 
-    copyFrom(data) {
+    copyFrom(data, format) {
         // [ num_channels, num_frames, sample_rate, data... ]
         Module.setValue(this.memory, data.numberOfChannels, "float");
         Module.setValue(this.memory + BYTES_PER_FLOAT, data.numberOfFrames, "float");
         Module.setValue(this.memory + 2 * BYTES_PER_FLOAT, data.sampleRate, "float");
 
-        const format = 'f32-planar';
         for (let i = 0; i < data.numberOfChannels; i++) {
             const offset = data.numberOfFrames * i;
             const samples = this.dataF32.subarray(offset, offset + data.numberOfFrames);
@@ -119,9 +118,9 @@ class AudioBlock {
 class PulseToneAdder {
     // PulseToneAdder is a class that tracks its own WASM memory
     // and supplies a "transform function" for a TransformStream
-    constructor() {
-        this.pulse = new Oscillator(0.75); // three pulses every four seconds
-        this.tone = new Oscillator(120.0); // 120Hz tone
+    constructor(pulseHz, toneHz) {
+        this.pulse = new Oscillator(pulseHz); // three pulses every four seconds
+        this.tone = new Oscillator(toneHz); // 120Hz tone
         this.block = new AudioBlock(); // block of audio data
     }
 
@@ -138,9 +137,8 @@ class PulseToneAdder {
         let block = this.block;
         const format = 'f32-planar';
         return (data, controller) => {
-            console.log("DEBUG PulseToneAdder.getTransform() callback");
             // copy data into WASM memory
-            block.copyFrom(data);
+            block.copyFrom(data, format);
 
             // this is where all the compute happens... in embedded WASM code
             wasm_addPulseTone(pulse.memory, tone.memory, block.memory);
@@ -169,16 +167,6 @@ class PeerData {
         this.stream = null;
         this.audio = new Audio();
         this.pulseToneAdder = null;
-
-        // DEBUG: these callbacks for making sure audio events are happening
-        this.audio.onabort = (event) => { console.log("DEBUG audio.onabort"); };
-        this.audio.onended = (event) => { console.log("DEBUG audio.onended"); };
-        this.audio.onpause = (event) => { console.log("DEBUG audio.onpause"); };
-        this.audio.onplay = (event) => { console.log("DEBUG audio.onplay"); };
-        this.audio.onplaying = (event) => { console.log("DEBUG audio.onplaying"); };
-        this.audio.onstalled = (event) => { console.log("DEBUG audio.onstalled"); };
-        this.audio.onsuspend = (event) => { console.log("DEBUG audio.onsuspend"); };
-        this.audio.onwaiting = (event) => { console.log("DEBUG audio.onwaiting"); };
     }
 
     createConnection() {
@@ -216,20 +204,9 @@ class PeerData {
                 console.log(`onTrack id=${id}`);
                 // event = { receiver, streams, track, transceiver }
                 if (event.track.kind == 'audio') {
-                    // connect stream to player
                     let peer = peers[id];
-                    /* this simple path works: stream straight to audio device
-                    if (peer) {
-                        console.log(`onTrack: id=${id} connecting inbound stream to audio element`);
-                        peer.audio.srcObject = event.streams[0];
-                        peer.audio.play();
-                    }
-                    */
-                    
-                    // This is what I'm trying to do: stream through processor before going
-                    // to audio device, but it doesn't work: no sound out the speakers.
-                    // In fact, the wasm_addPulseTone() method is never called. 
-                    // What am I doing wrong?
+
+                    // pipe stream through processor then to audio element
                     if (peer) {
                         console.log(`onTrack: id=${id} passing inbound stream through processor`);
                         if (peer.pulseToneAdder) {
@@ -238,7 +215,13 @@ class PeerData {
                             // and release its WASM memory
                             peer.stopAudio();
                         }
-                        peer.pulseToneAdder = new PulseToneAdder();
+                        let MIN_PULSE_HZ = 0.5;
+                        let MAX_PULSE_HZ = 1.5;
+                        let MIN_TONE_HZ = 60.0;
+                        let MAX_TONE_HZ = 500.0;
+                        let pulseHz = MIN_PULSE_HZ + (MAX_PULSE_HZ - MIN_PULSE_HZ) * Math.random();
+                        let toneHz = MIN_TONE_HZ + (MAX_TONE_HZ - MIN_TONE_HZ) * Math.random();
+                        peer.pulseToneAdder = new PulseToneAdder(pulseHz, toneHz);
 
                         // this is the insertable-streams magic: we create the cogs and pipes
                         let processor = new MediaStreamTrackProcessor({ track: event.track });
@@ -247,13 +230,7 @@ class PeerData {
                         const sink = generator.writable;
                         let transformer = new TransformStream({transform: peer.pulseToneAdder.getTransform()});
 
-                        // connect our contraption's output to the audio element
-                        let processedStream = new MediaStream();
-                        processedStream.addTrack(generator);
-                        peer.audio.srcObject = processedStream;
-                        peer.audio.play();
-
-                        // the abortController is for cleanup in case soemthing goes wrong
+                        // the abortController is for cleanup in case something goes wrong
                         // during the async pipeThrough operation
                         let abortController = new AbortController();
                         const signal = abortController.signal;
@@ -271,6 +248,22 @@ class PeerData {
                             sink.abort(e);
                             peer.stopAudio();
                         });
+
+                        // connect our contraption's output to the audio element
+                        //
+                        // BUG: the expected pipeline doesn't work:
+                        //   webrtcTrack --> processor --> transform --> generator --> modifiedStream --> audioElement
+                        // WORKAROUND: we can still get modified audio by maintaining two pipelines:
+                        //   webrtcTrack --> webrtcStream --> dummyAudioElement (with volume=0)
+                        //   webrtcTrack --> processor --> transform --> generator --> modifiedStream --> audioElement
+                        let dummyAudio = new Audio();
+                        dummyAudio.srcObject = event.streams[0];
+                        dummyAudio.volume = 0;
+                        dummyAudio.play();
+                        let modifiedStream = new MediaStream();
+                        modifiedStream.addTrack(generator);
+                        peer.audio.srcObject = modifiedStream;
+                        peer.audio.play();
                     }
                 }
             }
@@ -341,7 +334,6 @@ class PeerData {
     }
 
     stopAudio() {
-        console.log("DEBUG stopAudio()");
         if (this.audio) {
             this.audio.pause();
             this.audio.srcObject = null;
