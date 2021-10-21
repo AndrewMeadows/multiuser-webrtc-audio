@@ -1,6 +1,6 @@
 'use strict';
 
-let wasm_addPulseTone = Module.cwrap( "addPulseTone", null, ["number", "number", "number"]);
+let wasm_addPulseTone = Module.cwrap( "addPulseTone", null, ["number", "number", "number", "number"]);
 
 // check for support of insertable streams
 if (typeof MediaStreamTrackProcessor === 'undefined' ||
@@ -109,6 +109,13 @@ class AudioBlock {
         return this.dataF32.subarray(0, num_channels * num_samples);
     }
 
+    getNumChannels() {
+        // Note: the number of channels is set by input data in
+        // copyFrom(data, format) however the transform is allowed
+        // to change the count (e.g. upmix mono to stereo).
+        return Module.getValue(this.memory, "float");
+    }
+
     destroy() {
         Module._free(this.memory);
         this.memory = -1;
@@ -135,20 +142,24 @@ class PulseToneAdder {
         let pulse = this.pulse;
         let tone = this.tone;
         let block = this.block;
+        let rightShift = 0.1; // hard-coded stronger signal in right ear
         const format = 'f32-planar';
         return (data, controller) => {
             // copy data into WASM memory
             block.copyFrom(data, format);
 
             // this is where all the compute happens... in embedded WASM code
-            wasm_addPulseTone(pulse.memory, tone.memory, block.memory);
+            wasm_addPulseTone(pulse.memory, tone.memory, block.memory, rightShift);
 
             // pass the processed data to the controller
             controller.enqueue(new AudioData({
                 format,
                 sampleRate: data.sampleRate,
                 numberOfFrames: data.numberOfFrames,
-                numberOfChannels: data.numberOfChannels,
+                // Note: wasm_addPulseTone() always writes stero and will update
+                // the AudioBlock with the number of channels it has written
+                // so we get 'numberOfChannels' from 'block'.
+                numberOfChannels: block.getNumChannels(),
                 timestamp: data.timestamp,
                 data: block.getData()
             }));
@@ -228,6 +239,7 @@ class PeerData {
                         let generator = new MediaStreamTrackGenerator({ kind: 'audio' });
                         const source = processor.readable;
                         const sink = generator.writable;
+
                         let transformer = new TransformStream({transform: peer.pulseToneAdder.getTransform()});
 
                         // the abortController is for cleanup in case something goes wrong
