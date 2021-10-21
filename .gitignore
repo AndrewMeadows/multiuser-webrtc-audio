@@ -1,0 +1,6 @@
+# VIM swap files
+*.swp
+*.swo
+
+# specific wasm output
+js/addPulseTone.*
